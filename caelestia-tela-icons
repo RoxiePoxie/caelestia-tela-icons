@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Pick the Tela icon color closest to the current Caelestia color scheme.
+
+Caelestia runs this after every color change (theme.postHook in
+~/.config/caelestia/cli.json). It can also be run by hand:
+
+    caelestia-tela-icons            # apply the closest Tela theme
+    caelestia-tela-icons --dry-run  # only print what it would pick
+    caelestia-tela-icons --test ff0000 00aa00   # show picks for given colors
+"""
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Tela's folder colors, copied from its install.sh.
+# "standard" is installed as plain "Tela" (no color in the name).
+TELA_COLORS = {
+    "standard": "5294e2",
+    "black": "4d4d4d",
+    "blue": "5677fc",
+    "brown": "795548",
+    "green": "66bb6a",
+    "grey": "bdbdbd",
+    "orange": "ff9800",
+    "pink": "f06292",
+    "purple": "7e57c2",
+    "red": "ef5350",
+    "yellow": "ffca28",
+    "manjaro": "16a085",
+    "ubuntu": "fb8441",
+    "dracula": "44475a",
+    "nord": "4d576a",
+}
+
+# Seeds are sorted into three groups by chroma (how colorful they are):
+#   below GRAY_LIMIT    gray     -> black, grey, nord or dracula
+#   below MUTED_LIMIT   muted    -> any Tela color except pure black/grey
+#   MUTED_LIMIT and up  colorful -> only the colorful Tela colors
+# Matugen key colors are usually around 0.08, so without the last group a
+# lavender theme would get dull dracula folders instead of purple ones.
+GRAY_LIMIT = 0.03
+MUTED_LIMIT = 0.06
+GRAY_TELA = ("black", "grey", "nord", "dracula")
+HUELESS_TELA = ("black", "grey")  # no hue at all, so only gray seeds pick them
+
+# For colorful seeds the score is "hue difference in degrees" plus these
+# penalties. Raise them to care more about matching dark/light or muted/vivid.
+LIGHTNESS_PENALTY = 40   # per 1.0 of lightness difference (range 0 to 1)
+CHROMA_PENALTY = 100     # per 1.0 of chroma difference (range about 0 to 0.3)
+
+# For gray seeds: how much brightness counts in the plain color distance.
+LIGHTNESS_WEIGHT = 0.5
+
+# Follow the XDG base directory rules, like Caelestia itself does.
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+DATA_DIRS = (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+SCHEME_FILE = STATE_HOME / "caelestia/scheme.json"
+ICON_DIRS = [Path.home() / ".icons", DATA_HOME / "icons"] + [Path(d) / "icons" for d in DATA_DIRS if d]
+
+
+def hex_to_oklab(hex_color):
+    """Convert "rrggbb" to OKLab (L, a, b).
+
+    OKLab is a color space where equal distances look equally different to
+    the human eye, unlike plain RGB. That makes "closest color" mean
+    "looks closest".
+    """
+    rgb = [int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    # sRGB values are "gamma encoded"; undo that to get linear light.
+    r, g, b = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l, m, s = (math.copysign(abs(v) ** (1 / 3), v) for v in (l, m, s))
+    return (
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    )
+
+
+def distance(hex1, hex2):
+    l1, a1, b1 = hex_to_oklab(hex1)
+    l2, a2, b2 = hex_to_oklab(hex2)
+    return math.sqrt((LIGHTNESS_WEIGHT * (l1 - l2)) ** 2 + (a1 - a2) ** 2 + (b1 - b2) ** 2)
+
+
+def to_lch(hex_color):
+    """OKLab as (lightness, chroma, hue in degrees).
+
+    Chroma is how colorful a color is (0 = gray). Hue is its angle on the
+    color wheel: about 25 red, 65 orange, 145 green, 260 blue, 300 purple.
+    """
+    lightness, a, b = hex_to_oklab(hex_color)
+    return lightness, math.hypot(a, b), math.degrees(math.atan2(b, a)) % 360
+
+
+def colorful_score(seed, tela):
+    """Lower is better. Hue decides first; lightness and chroma break ties,
+    so a dark green still picks green, not black or teal."""
+    l1, c1, h1 = to_lch(seed)
+    l2, c2, h2 = to_lch(tela)
+    hue_diff = abs(h1 - h2)
+    hue_diff = min(hue_diff, 360 - hue_diff)  # the wheel wraps: 350 and 10 are close
+    return hue_diff + LIGHTNESS_PENALTY * abs(l1 - l2) + CHROMA_PENALTY * abs(c1 - c2)
+
+
+def closest_tela(hex_color):
+    _, seed_chroma, _ = to_lch(hex_color)
+    if seed_chroma < GRAY_LIMIT:
+        # A grayish seed has no meaningful hue, so plain distance is right here.
+        return min(GRAY_TELA, key=lambda name: distance(hex_color, TELA_COLORS[name]))
+    skip = HUELESS_TELA if seed_chroma < MUTED_LIMIT else GRAY_TELA
+    candidates = [name for name in TELA_COLORS if name not in skip]
+    return min(candidates, key=lambda name: colorful_score(hex_color, TELA_COLORS[name]))
+
+
+def theme_name(color, mode):
+    # "-dark" has light gray small icons for dark panels; "-light" the opposite.
+    suffix = "-light" if mode == "light" else "-dark"
+    return ("Tela" if color == "standard" else f"Tela-{color}") + suffix
+
+
+class HookError(Exception):
+    """An expected problem, shown as one clear line instead of a traceback."""
+
+
+def clean_hex(value):
+    """Accept "#7e57c2" or "7E57C2" and return "7e57c2"; reject anything else."""
+    value = str(value).strip().lstrip("#").lower()
+    if not re.fullmatch(r"[0-9a-f]{6}", value):
+        raise HookError(f"not a 6-digit hex color: {value!r}")
+    return value
+
+
+def read_scheme():
+    """Return (seed color, mode). Caelestia passes the colors in SCHEME_COLOURS;
+    when run by hand we read the saved scheme file instead."""
+    mode = os.environ.get("SCHEME_MODE")
+    colours = os.environ.get("SCHEME_COLOURS")
+    try:
+        if colours:
+            colours = json.loads(colours)
+        else:
+            data = json.loads(SCHEME_FILE.read_text(encoding="utf-8"))
+            colours, mode = data.get("colours"), mode or data.get("mode")
+    except FileNotFoundError:
+        raise HookError(f"no color scheme yet ({SCHEME_FILE} is missing)") from None
+    except (OSError, json.JSONDecodeError) as e:
+        raise HookError(f"could not read the color scheme: {e}") from None
+    if not isinstance(colours, dict):
+        raise HookError("the color scheme has no colours")
+    # The "key color" is the strong color Matugen built the palette from.
+    # "primary" is a pale tint of it in dark mode, so it is a worse guide.
+    seed = colours.get("primary_paletteKeyColor") or colours.get("primary")
+    if not seed:
+        raise HookError("the color scheme has no primary color")
+    return clean_hex(seed), "light" if mode == "light" else "dark"
+
+
+def find_plasma_changeicons():
+    # Its folder differs per distro (Fedora: libexec, Arch: lib).
+    for path in ("/usr/libexec/plasma-changeicons", "/usr/lib/plasma-changeicons",
+                 "/usr/lib/x86_64-linux-gnu/libexec/plasma-changeicons"):
+        if os.access(path, os.X_OK):
+            return path
+    return shutil.which("plasma-changeicons")
+
+
+def run(cmd):
+    """Run a command and return its output, or None if it is missing or fails."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def current_icon_theme():
+    kde = run(["kreadconfig6", "--file", "kdeglobals", "--group", "Icons", "--key", "Theme"])
+    if kde:
+        return kde
+    gtk = run(["gsettings", "get", "org.gnome.desktop.interface", "icon-theme"])
+    return gtk.strip("'") if gtk else None
+
+
+def apply(theme):
+    if not any((d / theme / "index.theme").is_file() for d in ICON_DIRS):
+        raise HookError(f"{theme} is not installed; install Tela with: ./install.sh -a")
+    changed = False
+    changeicons = find_plasma_changeicons()
+    if changeicons:
+        # KDE apps + Plasma; Plasma's gtkconfig module then copies it to GTK settings.ini.
+        changed |= run([changeicons, theme]) is not None
+    # GTK 4 apps such as Nautilus read this setting (and it is all there is outside KDE).
+    changed |= run(["gsettings", "set", "org.gnome.desktop.interface", "icon-theme", theme]) is not None
+    if not changed:
+        raise HookError("could not set the icon theme: neither plasma-changeicons nor gsettings worked")
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if args[:1] == ["--test"]:
+        for c in args[1:]:
+            print(f"#{clean_hex(c)} -> {closest_tela(clean_hex(c))}")
+        return 0
+    if args not in ([], ["--dry-run"]):
+        raise HookError(f"unknown option: {' '.join(args)} (try --help)")
+
+    seed, mode = read_scheme()
+    theme = theme_name(closest_tela(seed), mode)
+    if args == ["--dry-run"]:
+        print(f"seed #{seed}, mode {mode} -> {theme}")
+        return 0
+    if theme == current_icon_theme():
+        return 0  # nothing to do; avoids making every app reload its icons
+    apply(theme)
+    print(f"icons: #{seed} -> {theme}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except HookError as e:
+        print(f"caelestia-tela-icons: {e}", file=sys.stderr)
+        sys.exit(1)

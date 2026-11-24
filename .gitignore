@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Claude Code settings for the author's own machines
+.claude/
